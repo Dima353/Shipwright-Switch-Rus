@@ -48,9 +48,9 @@ const char* noControllerMsg[] = {
 };
 
 const char* pressStartMsg[] = {
-    "PRESS START",
-    "DRUCKE START",
-    "APPUYEZ SUR START",
+    "HAQMN CTAPT",
+    "HAQMN CTAPT",
+    "HAQMN CTAPT",
 };
 
 FontType sFontType;
@@ -411,7 +411,7 @@ void EnMag_DrawCharTexture(Gfx** gfxP, u8* texture, s32 rectLeft, s32 rectTop) {
 
 // #region SOH - Translate Title Screen
 bool EnMag_ShouldDrawNoController(Font* font, Gfx** gfxP, bool isActualText) {
-    if (!CVarGetInteger(CVAR_SETTING("TitleScreenTranslation"), 0) || !ResourceMgr_IsPalLoaded()) {
+    if (!CVarGetInteger(CVAR_SETTING("TitleScreenTranslation"), 1) || !ResourceMgr_IsPalLoaded()) {
         return true;
     }
     Gfx* gfx = *gfxP;
@@ -446,7 +446,7 @@ bool EnMag_ShouldDrawNoController(Font* font, Gfx** gfxP, bool isActualText) {
 }
 
 bool EnMag_ShouldDrawPressStart(Font* font, Gfx** gfxP, bool isActualText) {
-    if (!CVarGetInteger(CVAR_SETTING("TitleScreenTranslation"), 0) || !ResourceMgr_IsPalLoaded()) {
+    if (!CVarGetInteger(CVAR_SETTING("TitleScreenTranslation"), 1) || !ResourceMgr_IsPalLoaded()) {
         return true;
     }
     Gfx* gfx = *gfxP;
