@@ -87,6 +87,11 @@ std::filesystem::path SaveManager::GetFileTempName(int fileNum) {
     return sSavePath / ("file" + std::to_string(fileNum + 1) + ".temp");
 }
 
+std::filesystem::path SaveManager::GetFileBackupName(int fileNum) {
+    const std::filesystem::path sSavePath(Ship::Context::GetPathRelativeToAppDirectory("Save"));
+    return sSavePath / ("file" + std::to_string(fileNum + 1) + ".bak");
+}
+
 std::vector<RandomizerHint> Rando::StaticData::oldVerHintOrder{
     RH_COLOSSUS_GOSSIP_STONE,
     RH_DMC_GOSSIP_STONE,
@@ -487,12 +492,34 @@ void SaveManager::Init() {
 
     // Load files to initialize metadata
     for (int fileNum = 0; fileNum < MaxFiles; fileNum++) {
+#if defined(__SWITCH__)
+        // If a backup exists but the save doesn't, the previous save was interrupted between deleting the original and
+        // completing the copy.  Recover.
+        std::filesystem::path backupFile = GetFileBackupName(fileNum);
+        if (std::filesystem::exists(backupFile) && !std::filesystem::exists(GetFileName(fileNum))) {
+            SPDLOG_WARN("Save File - recovering backup for fileNum: {}", fileNum);
+            copy_file(backupFile.c_str(), GetFileName(fileNum).c_str());
+        }
+
+        // Clean up any stale/backup temp files from a completed save.
+        if (std::filesystem::exists(backupFile)) {
+            std::filesystem::remove(backupFile);
+        }
+
+        if (std::filesystem::path tempFile = GetFileTempName(fileNum); std::filesystem::exists(tempFile)) {
+            std::filesystem::remove(tempFile);
+        }
+#endif
         if (std::filesystem::exists(GetFileName(fileNum))) {
             StartupCheckAndInitMeta(fileNum);
         }
     }
     saveBlock = nlohmann::json::object();
     OTRGlobals::Instance->gRandoContext->ClearItemLocations();
+
+#if defined(__SWITCH__)
+    InitSaveWorker();
+#endif
 }
 
 void SaveManager::StartupCheckAndInitMeta(int fileNum) {
@@ -1188,7 +1215,37 @@ void SaveManager::SaveFileThreaded(int fileNum, SaveContext* saveContext, int se
     output.close();
 #endif
 
-#if defined(__SWITCH__) || defined(__WIIU__)
+#if defined(__SWITCH__)
+    // Backup-safe file replacement: ensure a valid save always exists on disk.  If we crash between any of these
+    // steps, Init() will recover from the backup.
+    const std::filesystem::path backupFile = GetFileBackupName(fileNum);
+    if (std::filesystem::exists(fileName)) {
+        // Preserve the current save as a backup before touching it.
+        if (std::filesystem::exists(backupFile)) {
+            std::filesystem::remove(backupFile);
+        }
+
+        copy_file(fileName.c_str(), backupFile.c_str());
+        std::filesystem::remove(fileName);
+    }
+
+    if (copy_file(tempFile.c_str(), fileName.c_str()) == 0) {
+        // New save written successfully, clean up.
+        if (std::filesystem::exists(backupFile)) {
+            std::filesystem::remove(backupFile);
+        }
+
+        if (std::filesystem::exists(tempFile)) {
+            std::filesystem::remove(tempFile);
+        }
+    } else {
+        // Copy failed, restore from backup.
+        SPDLOG_ERROR("Save File - copy failed for fileNum: {}, restoring backup", fileNum);
+        if (std::filesystem::exists(backupFile)) {
+            copy_file(backupFile.c_str(), fileName.c_str());
+        }
+    }
+#elif defined(__WIIU__)
     if (std::filesystem::exists(fileName)) {
         std::filesystem::remove(fileName);
     }
@@ -1221,11 +1278,62 @@ void SaveManager::SaveSection(int fileNum, int sectionID, bool threaded) {
     }
     auto saveContext = new SaveContext;
     memcpy(saveContext, &gSaveContext, sizeof(gSaveContext));
+
+#if defined(__SWITCH__)
+    // Build JSON on the main thread where game state is consistent. Section handlers read globals beyond gSaveContext,
+    // so running them on a background thread races with scene transitions and gameplay updates.
+    SPDLOG_INFO("Save File - fileNum: {}", fileNum);
+    saveBlock["version"] = 1;
+    saveBlock["fileType"] = IS_RANDO ? FILE_TYPE_SAVE_RANDO : FILE_TYPE_SAVE_VANILLA;
+
+    if (sectionID == SECTION_ID_BASE) {
+        for (auto& val : sectionSaveHandlers | std::views::values) {
+            auto& saveFuncInfo = val;
+            if (!saveFuncInfo.saveWithBase || (saveFuncInfo.name == "randomizer" && !IS_RANDO)) {
+                continue;
+            }
+
+            nlohmann::json& sectionBlock = saveBlock["sections"][saveFuncInfo.name];
+            sectionBlock["version"] = val.version;
+            currentJsonContext = &sectionBlock["data"];
+            val.func(saveContext, sectionID, true);
+        }
+    } else {
+        SaveFuncInfo svi = sectionSaveHandlers.find(sectionID)->second;
+        auto& sectionName = svi.name;
+        auto sectionVersion = svi.version;
+
+        if (svi.parentSection != -1 && svi.parentSection < sectionIndex) {
+            const auto parentSvi = sectionSaveHandlers.find(svi.parentSection)->second;
+            sectionName = parentSvi.name;
+            sectionVersion = parentSvi.version;
+        }
+
+        nlohmann::json& sectionBlock = saveBlock["sections"][sectionName];
+        sectionBlock["version"] = sectionVersion;
+        currentJsonContext = &sectionBlock["data"];
+        svi.func(saveContext, sectionID, false);
+    }
+
+    // Serialize to string on main thread, then dispatch only file I/O to pthread.
+    const auto jsonData = new std::string(saveBlock.dump(1));
+    delete saveContext;
+
+    if (threaded) {
+        pthread_mutex_lock(&mSaveWorkerMtx);
+        mSaveJobQueue.push({ fileNum, jsonData, sectionID });
+        pthread_cond_signal(&mSaveWorkerCond);
+        pthread_mutex_unlock(&mSaveWorkerMtx);
+    } else {
+        SaveFileIOThreaded(fileNum, jsonData, sectionID);
+    }
+#else
     if (threaded) {
         smThreadPool->detach_task(std::bind(&SaveManager::SaveFileThreaded, this, fileNum, saveContext, sectionID));
     } else {
         SaveFileThreaded(fileNum, saveContext, sectionID);
     }
+#endif
 }
 
 void SaveManager::SaveFile(int fileNum) {
@@ -1327,18 +1435,36 @@ void SaveManager::LoadFile(int fileNum) {
 }
 
 void SaveManager::ThreadPoolWait() {
+#if defined(__SWITCH__)
+    // Wait for all pending save jobs to finish without stopping the worker thread.  The loop guards against spurious
+    // wakes -- we need both an empty queue and the worker not mid-I/O before proceeding.
+    pthread_mutex_lock(&mSaveWorkerMtx);
+
+    while (!mSaveJobQueue.empty() || mSaveWorkerBusy) {
+        pthread_cond_wait(&mSaveWorkerDoneCond, &mSaveWorkerMtx);
+    }
+
+    pthread_mutex_unlock(&mSaveWorkerMtx);
+#endif
     if (smThreadPool) {
         smThreadPool->wait();
     }
 }
 
 bool SaveManager::SaveFile_Exist(int fileNum) {
+#if defined(__SWITCH__)
+    // Exception unwinding fails on Switch (calls abort instead of catching), so we use the non-throwing overload to
+    // avoid crashes when the save thread has the file in a transitional state during backup-safe replacement.
+    std::error_code ec = {};
+    return std::filesystem::exists(GetFileName(fileNum), ec);
+#else
     try {
         return std::filesystem::exists(GetFileName(fileNum));
     } catch (std::filesystem::filesystem_error const& ex) {
         SPDLOG_ERROR("Filesystem error");
         return false;
     }
+#endif
 }
 
 void SaveManager::AddInitFunction(InitFunc func) {
@@ -2784,6 +2910,130 @@ void SaveManager::ConvertFromUnversioned() {
 #undef SLOT_SIZE
 #undef SLOT_OFFSET
 }
+
+#if defined(__SWITCH__)
+SaveManager::~SaveManager() {
+    if (mSaveWorkerRunning) {
+        ShutdownSaveWorker();
+    }
+}
+
+void SaveManager::SaveFileIOThreaded(int fileNum, std::string* jsonData, int sectionID) {
+    saveMtx.lock();
+
+    const std::filesystem::path fileName = GetFileName(fileNum);
+    const std::filesystem::path tempFile = GetFileTempName(fileNum);
+
+    if (std::filesystem::exists(tempFile)) {
+        std::filesystem::remove(tempFile);
+    }
+
+    FILE* w = fopen(tempFile.c_str(), "w");
+    fwrite(jsonData->c_str(), sizeof(char), jsonData->length(), w);
+    fclose(w);
+    delete jsonData;
+
+    // Backup-safe file replacement: ensure a valid save always exists on disk. If we crash between any of these
+    // steps, Init() will recover from the backup.
+    const std::filesystem::path backupFile = GetFileBackupName(fileNum);
+
+    if (std::filesystem::exists(fileName)) {
+        if (std::filesystem::exists(backupFile)) {
+            std::filesystem::remove(backupFile);
+        }
+
+        copy_file(fileName.c_str(), backupFile.c_str());
+        std::filesystem::remove(fileName);
+    }
+
+    if (copy_file(tempFile.c_str(), fileName.c_str()) == 0) {
+        if (std::filesystem::exists(backupFile)) {
+            std::filesystem::remove(backupFile);
+        }
+
+        if (std::filesystem::exists(tempFile)) {
+            std::filesystem::remove(tempFile);
+        }
+    } else {
+        SPDLOG_ERROR("Save File - copy failed for fileNum: {}, restoring backup", fileNum);
+
+        if (std::filesystem::exists(backupFile)) {
+            copy_file(backupFile.c_str(), fileName.c_str());
+        }
+    }
+
+    InitMeta(fileNum);
+    GameInteractor::Instance->ExecuteHooks<GameInteractor::OnSaveFile>(fileNum, sectionID);
+    SPDLOG_INFO("Save File Finish - fileNum: {}", fileNum);
+    saveMtx.unlock();
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// Instead of creating and joining a pthread per save (which blocks the main thread on SD card I/O), a single worker
+// thread with a 2MB stack sleeps on mSaveWorkerCond and wakes to process queued SaveJobs.
+//
+// Two condition variables serve different purposes:
+//  - mSaveWorkerCond:      signals the worker that a new job is available or that it should shut down.
+//  - mSaveWorkerDoneCond:  signals ThreadPoolWait that the worker has finished a job and is idle.
+//
+// mSaveWorkerBusy tracks whether the worker is mid-I/O, so ThreadPoolWait can distinguish "queue empty but still
+// writing" from "fully idle."
+// --------------------------------------------------------------------------------------------------------------------
+
+void SaveManager::InitSaveWorker() {
+    // Idempotent -- Init() is called on every game load, but the worker only needs to be created once.
+    if (mSaveWorkerRunning) {
+        return;
+    }
+
+    mSaveWorkerRunning = true;
+
+    pthread_attr_t attr = {};
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 0x200000); // 2MB
+    pthread_create(&mSaveWorker, &attr, SaveWorkerEntry, this);
+    pthread_attr_destroy(&attr);
+}
+
+void SaveManager::ShutdownSaveWorker() {
+    pthread_mutex_lock(&mSaveWorkerMtx);
+    mSaveWorkerRunning = false;
+    pthread_cond_signal(&mSaveWorkerCond);
+    pthread_mutex_unlock(&mSaveWorkerMtx);
+    pthread_join(mSaveWorker, nullptr);
+}
+
+void* SaveManager::SaveWorkerEntry(void* arg) {
+    const auto self = static_cast<SaveManager*>(arg);
+
+    while (true) {
+        pthread_mutex_lock(&self->mSaveWorkerMtx);
+
+        while (self->mSaveJobQueue.empty() && self->mSaveWorkerRunning) {
+            pthread_cond_wait(&self->mSaveWorkerCond, &self->mSaveWorkerMtx);
+        }
+
+        if (!self->mSaveWorkerRunning && self->mSaveJobQueue.empty()) {
+            pthread_mutex_unlock(&self->mSaveWorkerMtx);
+            break;
+        }
+
+        const auto [fileNum, json, sectionID] = self->mSaveJobQueue.front();
+        self->mSaveJobQueue.pop();
+        self->mSaveWorkerBusy = true;
+        pthread_mutex_unlock(&self->mSaveWorkerMtx);
+
+        self->SaveFileIOThreaded(fileNum, json, sectionID);
+
+        pthread_mutex_lock(&self->mSaveWorkerMtx);
+        self->mSaveWorkerBusy = false;
+        pthread_cond_signal(&self->mSaveWorkerDoneCond);
+        pthread_mutex_unlock(&self->mSaveWorkerMtx);
+    }
+
+    return nullptr;
+}
+#endif
 
 // C to C++ bridge
 

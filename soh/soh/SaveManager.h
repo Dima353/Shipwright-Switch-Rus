@@ -59,6 +59,11 @@ typedef enum {
 
 #include <nlohmann/json.hpp>
 
+#if defined(__SWITCH__)
+#include <pthread.h>
+#include <queue>
+#endif
+
 class SaveManager {
   public:
     static SaveManager* Instance;
@@ -157,6 +162,7 @@ class SaveManager {
   private:
     std::filesystem::path GetFileName(int fileNum);
     std::filesystem::path GetFileTempName(int fileNum);
+    std::filesystem::path GetFileBackupName(int fileNum);
     nlohmann::json saveBlock;
 
     void ConvertFromUnversioned();
@@ -196,6 +202,30 @@ class SaveManager {
     nlohmann::json::iterator currentJsonArrayContext;
     std::shared_ptr<BS::thread_pool> smThreadPool;
     std::mutex saveMtx;
+
+#if defined(__SWITCH__)
+    ~SaveManager();
+
+    void SaveFileIOThreaded(int fileNum, std::string* jsonData, int sectionID);
+
+    void InitSaveWorker();
+    void ShutdownSaveWorker();
+    static void* SaveWorkerEntry(void* arg);
+
+    struct SaveJob {
+        int fileNum = -1;
+        std::string* json = nullptr;
+        int sectionID = -1;
+    };
+
+    pthread_t mSaveWorker = {};
+    pthread_mutex_t mSaveWorkerMtx = PTHREAD_MUTEX_INITIALIZER;    // Protects queue, busy flag, and running flag.
+    pthread_cond_t mSaveWorkerCond = PTHREAD_COND_INITIALIZER;     // Signals new work or shutdown to the worker.
+    pthread_cond_t mSaveWorkerDoneCond = PTHREAD_COND_INITIALIZER; // Signals ThreadPoolWait that the worker is idle.
+    bool mSaveWorkerRunning = false;
+    bool mSaveWorkerBusy = false;
+    std::queue<SaveJob> mSaveJobQueue = {};
+#endif
 };
 
 #else
